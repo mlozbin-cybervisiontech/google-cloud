@@ -24,6 +24,7 @@ import com.google.cloud.spanner.DatabaseId;
 import com.google.cloud.spanner.Mutation;
 import com.google.cloud.spanner.Spanner;
 import io.cdap.cdap.api.data.format.StructuredRecord;
+import io.cdap.cdap.api.data.format.UnexpectedFormatException;
 import io.cdap.cdap.api.data.schema.Schema;
 import io.cdap.plugin.gcp.spanner.SpannerConstants;
 import io.cdap.plugin.gcp.spanner.common.SpannerUtil;
@@ -36,10 +37,15 @@ import org.apache.hadoop.mapreduce.RecordWriter;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
 
 import java.io.IOException;
+import java.lang.reflect.Array;
 import java.time.LocalDate;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.List;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
  * Spanner output format
@@ -50,7 +56,7 @@ public class SpannerOutputFormat extends OutputFormat<NullWritable, StructuredRe
    * Get properties from SparkSinkConfig and store them as properties in Configuration
    *
    * @param configuration the Hadoop configuration to set the properties in
-   * @param config the spanner configuration
+   * @param config        the spanner configuration
    */
   public static void configure(Configuration configuration, SpannerSinkConfig config) {
     String projectId = config.getProject();
@@ -105,7 +111,7 @@ public class SpannerOutputFormat extends OutputFormat<NullWritable, StructuredRe
     }
 
     @Override
-    public void write(NullWritable nullWritable, StructuredRecord record) throws IOException {
+    public void write(NullWritable nullWritable, StructuredRecord record) {
       Mutation.WriteBuilder builder = Mutation.newInsertOrUpdateBuilder(tableName);
       List<Schema.Field> fields = schema.getFields();
       for (Schema.Field field : fields) {
@@ -129,14 +135,14 @@ public class SpannerOutputFormat extends OutputFormat<NullWritable, StructuredRe
                 builder.set(name).to(spannerTs);
                 break;
               default:
-                throw new IOException("Logical type" + logicalType + " is not supported.");
+                throw new IllegalStateException("Logical type '" + logicalType + "' is not supported.");
             }
           }
           continue;
         }
 
         Schema.Type type = fieldSchema.getType();
-        switch(type) {
+        switch (type) {
           case BOOLEAN:
             builder.set(name).to(record.<Boolean>get(name));
             break;
@@ -173,9 +179,15 @@ public class SpannerOutputFormat extends OutputFormat<NullWritable, StructuredRe
               builder.set(name).to(ByteArray.copyFrom(byteArray));
             }
             break;
-          // todo CDAP-14233 - add support for array
+          case ARRAY:
+            Schema componentSchema = fieldSchema.getComponentSchema();
+            if (componentSchema == null) {
+              throw new IllegalStateException("Component schema of field '" + name + "' is null");
+            }
+            writeArray(name, fieldSchema.getComponentSchema(), record.get(name), builder);
+            break;
           default:
-            throw new IOException(type.name() + " : Type currently not supported.");
+            throw new IllegalStateException(type.name() + " : Type currently not supported.");
         }
       }
       mutations.add(builder.build());
@@ -230,5 +242,126 @@ public class SpannerOutputFormat extends OutputFormat<NullWritable, StructuredRe
 
       }
     };
+  }
+
+  private static void writeArray(String name, Schema componentSchema, Object values, Mutation.WriteBuilder builder) {
+    Schema unionSchema = componentSchema.getUnionSchema(0);
+    if (unionSchema == null) {
+      throw new IllegalStateException("Union schema of '" + componentSchema.getRecordName() + "' is null");
+    }
+
+    Schema.LogicalType logicalType = unionSchema.getLogicalType();
+    if (logicalType != null) {
+      switch (logicalType) {
+        case DATE:
+          Collection<LocalDate> dateList = toCollection(name, logicalType.toString(), values);
+          builder.set(name)
+            .toDateArray(
+              dateList.stream()
+                .map(date -> Date.fromYearMonthDay(date.getYear(), date.getMonthValue(), date.getDayOfMonth()))
+                .collect(Collectors.toList())
+            );
+          break;
+        case TIMESTAMP_MILLIS:
+        case TIMESTAMP_MICROS:
+          Collection<ZonedDateTime> timestampList = toCollection(name, logicalType.toString(), values);
+          builder.set(name)
+            .toTimestampArray(
+              timestampList.stream()
+                .map(ts -> Timestamp.ofTimeSecondsAndNanos(ts.toEpochSecond(), ts.getNano()))
+                .collect(Collectors.toList())
+            );
+          break;
+        default:
+          throw new IllegalStateException("Array of '" + logicalType + "' logical type currently not supported.");
+      }
+    } else {
+      Schema.Type type = unionSchema.getType();
+      switch (type) {
+        case BOOLEAN:
+          Collection<Boolean> listBoolean = toCollection(name, type.toString(), values);
+          builder.set(name).toBoolArray(listBoolean);
+          break;
+        case STRING:
+          Collection<String> listString = toCollection(name, type.toString(), values);
+          builder.set(name).toStringArray(listString);
+          break;
+        case LONG:
+          Collection<Long> listValue = toCollection(name, type.toString(), values);
+          builder.set(name).toInt64Array(listValue);
+          break;
+        case DOUBLE:
+          Collection<Double> listDouble = toCollection(name, type.toString(), values);
+          builder.set(name).toFloat64Array(listDouble);
+          break;
+        case INT:
+          Collection<Integer> integerList = toCollection(name, type.toString(), values);
+          builder.set(name)
+            .toInt64Array(
+              integerList.stream()
+                .map(Integer::longValue)
+                .collect(Collectors.toList())
+            );
+          break;
+        case FLOAT:
+          Collection<Float> floatList = toCollection(name, type.toString(), values);
+          builder.set(name)
+            .toFloat64Array(
+              floatList.stream()
+                .map(Float::doubleValue)
+                .collect(Collectors.toList())
+            );
+          break;
+        case BYTES:
+          Collection<byte[]> bytesList = toCollection(name, type.toString(), values);
+          builder.set(name)
+            .toBytesArray(
+              bytesList.stream()
+                .map(ByteArray::copyFrom)
+                .collect(Collectors.toList())
+            );
+          break;
+        default:
+          throw new IllegalStateException("Array of '" + type.name() + "' type currently not supported.");
+      }
+    }
+  }
+
+  private static <T> Collection<T> toCollection(String fieldName, String fieldType, Object value) {
+    Function<String, Collection> valueExtractor = name -> {
+      throw new UnexpectedFormatException(
+        String.format("Field '%s' of type '%s' has unexpected value '%s'", name, fieldType, value));
+    };
+
+    if (value instanceof Collection) {
+      valueExtractor = name -> (Collection<?>) value;
+    } else if (value.getClass().isArray()) {
+      valueExtractor = name -> convertToObjectCollection(value);
+    }
+    return getValue(valueExtractor, fieldName, fieldType, Collection.class);
+  }
+
+  private static Collection<Object> convertToObjectCollection(Object array) {
+    Class ofArray = array.getClass().getComponentType();
+    if (ofArray.isPrimitive()) {
+      List<Object> list = new ArrayList<>();
+      int length = Array.getLength(array);
+      for (int i = 0; i < length; i++) {
+        list.add(Array.get(array, i));
+      }
+      return list;
+    } else {
+      return Arrays.asList((Object[]) array);
+    }
+  }
+
+  private static <T> T getValue(Function<String, T> valueExtractor, String fieldName, String fieldType,
+                                Class<T> clazz) {
+    T value = valueExtractor.apply(fieldName);
+    if (clazz.isAssignableFrom(value.getClass())) {
+      return clazz.cast(value);
+    }
+    throw new UnexpectedFormatException(
+      String.format("Field '%s' is not of expected type '%s'", fieldName, fieldType));
   }
 }
